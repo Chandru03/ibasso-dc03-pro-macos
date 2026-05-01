@@ -10,7 +10,6 @@ private enum DC03Error: Error, CustomStringConvertible {
     case noDevice
     case openFailed(IOReturn)
     case sendFailed(IOReturn)
-    case invalidRawReport
 
     var description: String {
         switch self {
@@ -20,8 +19,6 @@ private enum DC03Error: Error, CustomStringConvertible {
             return "Open failed \(String(format: "0x%08x", status))"
         case .sendFailed(let status):
             return "Send failed \(String(format: "0x%08x", status))"
-        case .invalidRawReport:
-            return "Raw report must be 16 bytes"
         }
     }
 }
@@ -63,10 +60,6 @@ private let volumeSteps: [UInt8] = [
     10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
     0,
 ]
-
-private func hexString(_ bytes: [UInt8]) -> String {
-    bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
-}
 
 private func writeRegister(
     seq: UInt8,
@@ -199,28 +192,6 @@ private func presetReports(_ preset: Preset) -> [[UInt8]] {
         + volumeReports(volume: preset.volume, balance: preset.balance)
 }
 
-private func parseRawReport(_ raw: String) throws -> [UInt8] {
-    let cleaned = raw
-        .replacingOccurrences(of: " ", with: "")
-        .replacingOccurrences(of: ":", with: "")
-        .replacingOccurrences(of: ",", with: "")
-    guard cleaned.count == 32 else {
-        throw DC03Error.invalidRawReport
-    }
-
-    var result: [UInt8] = []
-    var index = cleaned.startIndex
-    while index < cleaned.endIndex {
-        let next = cleaned.index(index, offsetBy: 2)
-        guard let byte = UInt8(cleaned[index..<next], radix: 16) else {
-            throw DC03Error.invalidRawReport
-        }
-        result.append(byte)
-        index = next
-    }
-    return result
-}
-
 private final class DC03Device {
     static func matchingDevices() -> [IOHIDDevice] {
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -276,19 +247,21 @@ private final class DC03Device {
 
 private final class ControlViewController: NSViewController {
     private let statusLabel = NSTextField(labelWithString: "Checking...")
-    private let logLabel = NSTextField(labelWithString: "No reports sent yet")
+    private let statusDot = NSView()
+    private let feedbackLabel = NSTextField(labelWithString: "")
+    private let volumeValueLabel = NSTextField(labelWithString: "75")
+    private let balanceValueLabel = NSTextField(labelWithString: "0")
     private let volumeSlider = NSSlider(value: 75, minValue: 0, maxValue: 100, target: nil, action: nil)
     private let balanceSlider = NSSlider(value: 0, minValue: -50, maxValue: 50, target: nil, action: nil)
     private let filterPopup = NSPopUpButton()
     private let gainPopup = NSPopUpButton()
     private let outputPopup = NSPopUpButton()
-    private let rawField = NSTextField(string: "11118860000005090000000200000000")
     var onStatusChange: ((Bool) -> Void)?
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 570))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 368, height: 500))
         view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        view.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
         buildUI()
         refreshStatus()
     }
@@ -296,8 +269,8 @@ private final class ControlViewController: NSViewController {
     private func buildUI() {
         let root = NSStackView()
         root.orientation = .vertical
-        root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        root.spacing = 14
+        root.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
         root.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(root)
 
@@ -308,98 +281,196 @@ private final class ControlViewController: NSViewController {
             root.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
 
-        let title = NSTextField(labelWithString: appName)
-        title.font = .boldSystemFont(ofSize: 18)
-        root.addArrangedSubview(title)
-
-        statusLabel.textColor = .secondaryLabelColor
-        root.addArrangedSubview(statusLabel)
-
-        let refresh = button("Refresh Device", action: #selector(refreshPressed))
-        root.addArrangedSubview(refresh)
-
-        root.addArrangedSubview(separator())
-
-        let presetsLabel = sectionLabel("Presets")
-        root.addArrangedSubview(presetsLabel)
-        let presetGrid = NSStackView()
-        presetGrid.orientation = .vertical
-        presetGrid.spacing = 8
-        for preset in presets {
-            let item = NSButton(title: preset.name, target: self, action: #selector(presetPressed(_:)))
-            item.bezelStyle = .rounded
-            item.identifier = NSUserInterfaceItemIdentifier(preset.name)
-            presetGrid.addArrangedSubview(item)
-        }
-        root.addArrangedSubview(presetGrid)
-
-        root.addArrangedSubview(separator())
+        root.addArrangedSubview(headerView())
+        root.addArrangedSubview(presetsView())
 
         filterPopup.addItems(withTitles: filterNames.enumerated().map { "\($0.offset): \($0.element)" })
         gainPopup.addItems(withTitles: ["Low", "Medium", "High"])
         outputPopup.addItems(withTitles: ["Normal", "Power saving"])
-        root.addArrangedSubview(row("Filter", filterPopup, button("Apply", action: #selector(applyFilter))))
-        root.addArrangedSubview(row("Gain", gainPopup, button("Apply", action: #selector(applyGain))))
-        root.addArrangedSubview(row("Output", outputPopup, button("Apply", action: #selector(applyOutput))))
+        root.addArrangedSubview(settingsView())
 
-        root.addArrangedSubview(separator())
+        volumeSlider.target = self
+        volumeSlider.action = #selector(sliderChanged)
+        balanceSlider.target = self
+        balanceSlider.action = #selector(sliderChanged)
+        root.addArrangedSubview(volumeView())
 
-        root.addArrangedSubview(sliderRow("Volume", volumeSlider))
-        root.addArrangedSubview(sliderRow("Balance", balanceSlider))
-        root.addArrangedSubview(button("Apply Volume + Balance", action: #selector(applyVolume)))
-
-        root.addArrangedSubview(separator())
-
-        root.addArrangedSubview(sectionLabel("Raw 16-byte report"))
-        rawField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        root.addArrangedSubview(rawField)
-        root.addArrangedSubview(button("Send Raw Report", action: #selector(sendRaw)))
-
-        logLabel.textColor = .secondaryLabelColor
-        logLabel.lineBreakMode = .byTruncatingMiddle
-        root.addArrangedSubview(logLabel)
-
-        let quit = button("Quit", action: #selector(quit))
-        root.addArrangedSubview(quit)
+        feedbackLabel.font = .systemFont(ofSize: 12)
+        feedbackLabel.textColor = .secondaryLabelColor
+        feedbackLabel.alignment = .center
+        root.addArrangedSubview(feedbackLabel)
     }
 
-    private func button(_ title: String, action: Selector) -> NSButton {
+    private func headerView() -> NSView {
+        let container = NSStackView()
+        container.orientation = .horizontal
+        container.spacing = 12
+        container.alignment = .centerY
+
+        let icon = symbolBadge("waveform", size: 38)
+        container.addArrangedSubview(icon)
+
+        let titleStack = NSStackView()
+        titleStack.orientation = .vertical
+        titleStack.spacing = 3
+
+        let title = NSTextField(labelWithString: appName)
+        title.font = .systemFont(ofSize: 17, weight: .medium)
+        title.textColor = .labelColor
+        titleStack.addArrangedSubview(title)
+
+        let statusStack = NSStackView()
+        statusStack.orientation = .horizontal
+        statusStack.spacing = 6
+        statusStack.alignment = .centerY
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 4
+        statusDot.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        statusDot.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        statusStack.addArrangedSubview(statusDot)
+        statusStack.addArrangedSubview(statusLabel)
+        titleStack.addArrangedSubview(statusStack)
+
+        container.addArrangedSubview(titleStack)
+        titleStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let refresh = iconButton("arrow.clockwise", action: #selector(refreshPressed))
+        container.addArrangedSubview(refresh)
+        return container
+    }
+
+    private func presetsView() -> NSView {
+        let content = cardStack(title: "Presets")
+        let rows = NSStackView()
+        rows.orientation = .vertical
+        rows.spacing = 8
+
+        for chunkStart in stride(from: 0, to: presets.count, by: 2) {
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.spacing = 8
+            for preset in presets[chunkStart..<min(chunkStart + 2, presets.count)] {
+                let item = NSButton(title: preset.name, target: self, action: #selector(presetPressed(_:)))
+                item.bezelStyle = .rounded
+                item.controlSize = .large
+                item.font = .systemFont(ofSize: 13, weight: .medium)
+                item.identifier = NSUserInterfaceItemIdentifier(preset.name)
+                row.addArrangedSubview(item)
+                item.widthAnchor.constraint(equalToConstant: 154).isActive = true
+            }
+            rows.addArrangedSubview(row)
+        }
+
+        content.addArrangedSubview(rows)
+        return content.enclosingCard()
+    }
+
+    private func settingsView() -> NSView {
+        let content = cardStack(title: "Sound")
+        content.addArrangedSubview(controlRow("Filter", control: filterPopup, actionTitle: "Set", action: #selector(applyFilter)))
+        content.addArrangedSubview(controlRow("Gain", control: gainPopup, actionTitle: "Set", action: #selector(applyGain)))
+        content.addArrangedSubview(controlRow("Output", control: outputPopup, actionTitle: "Set", action: #selector(applyOutput)))
+        return content.enclosingCard()
+    }
+
+    private func volumeView() -> NSView {
+        let content = cardStack(title: "Level")
+        content.addArrangedSubview(sliderRow("Volume", volumeSlider, valueLabel: volumeValueLabel))
+        content.addArrangedSubview(sliderRow("Balance", balanceSlider, valueLabel: balanceValueLabel))
+        let apply = primaryButton("Apply Level", action: #selector(applyVolume))
+        content.addArrangedSubview(apply)
+        return content.enclosingCard()
+    }
+
+    private func cardStack(title: String) -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+
+        let label = sectionLabel(title)
+        stack.addArrangedSubview(label)
+        return stack
+    }
+
+    private func symbolBadge(_ symbolName: String, size: CGFloat) -> NSView {
+        let badge = NSView()
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
+        badge.layer?.cornerRadius = 11
+        badge.widthAnchor.constraint(equalToConstant: size).isActive = true
+        badge.heightAnchor.constraint(equalToConstant: size).isActive = true
+
+        let imageView = NSImageView()
+        imageView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+        imageView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 17, weight: .medium)
+        imageView.contentTintColor = .labelColor
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        badge.addSubview(imageView)
+
+        NSLayoutConstraint.activate([
+            imageView.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
+            imageView.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+        ])
+
+        return badge
+    }
+
+    private func iconButton(_ symbolName: String, action: Selector) -> NSButton {
+        let button = NSButton(image: NSImage(systemSymbolName: symbolName, accessibilityDescription: "Refresh") ?? NSImage(), target: self, action: action)
+        button.bezelStyle = .rounded
+        button.controlSize = .large
+        button.imagePosition = .imageOnly
+        button.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        return button
+    }
+
+    private func primaryButton(_ title: String, action: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
+        button.controlSize = .large
+        button.font = .systemFont(ofSize: 13, weight: .medium)
         return button
     }
 
     private func sectionLabel(_ title: String) -> NSTextField {
         let label = NSTextField(labelWithString: title)
-        label.font = .boldSystemFont(ofSize: 12)
+        label.font = .systemFont(ofSize: 12, weight: .medium)
         label.textColor = .secondaryLabelColor
         return label
     }
 
-    private func separator() -> NSBox {
-        let box = NSBox()
-        box.boxType = .separator
-        return box
-    }
-
-    private func row(_ label: String, _ control: NSView, _ action: NSButton) -> NSStackView {
+    private func controlRow(_ label: String, control: NSView, actionTitle: String, action: Selector) -> NSStackView {
         let title = NSTextField(labelWithString: label)
-        title.widthAnchor.constraint(equalToConstant: 58).isActive = true
-        control.widthAnchor.constraint(equalToConstant: 172).isActive = true
-        let stack = NSStackView(views: [title, control, action])
+        title.font = .systemFont(ofSize: 13)
+        title.textColor = .labelColor
+        title.widthAnchor.constraint(equalToConstant: 56).isActive = true
+        control.widthAnchor.constraint(equalToConstant: 178).isActive = true
+        let actionButton = primaryButton(actionTitle, action: action)
+        actionButton.widthAnchor.constraint(equalToConstant: 58).isActive = true
+        let stack = NSStackView(views: [title, control, actionButton])
         stack.orientation = .horizontal
-        stack.spacing = 8
+        stack.spacing = 10
         stack.alignment = .centerY
         return stack
     }
 
-    private func sliderRow(_ label: String, _ slider: NSSlider) -> NSStackView {
+    private func sliderRow(_ label: String, _ slider: NSSlider, valueLabel: NSTextField) -> NSStackView {
         let title = NSTextField(labelWithString: label)
-        title.widthAnchor.constraint(equalToConstant: 58).isActive = true
-        slider.widthAnchor.constraint(equalToConstant: 242).isActive = true
-        let stack = NSStackView(views: [title, slider])
+        title.font = .systemFont(ofSize: 13)
+        title.textColor = .labelColor
+        title.widthAnchor.constraint(equalToConstant: 56).isActive = true
+        slider.widthAnchor.constraint(equalToConstant: 202).isActive = true
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        valueLabel.textColor = .secondaryLabelColor
+        valueLabel.alignment = .right
+        valueLabel.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        let stack = NSStackView(views: [title, slider, valueLabel])
         stack.orientation = .horizontal
-        stack.spacing = 8
+        stack.spacing = 10
         stack.alignment = .centerY
         return stack
     }
@@ -410,9 +481,14 @@ private final class ControlViewController: NSViewController {
 
     private func refreshStatus() {
         let available = DC03Device.isAvailable()
-        statusLabel.stringValue = available ? "DC03 Pro detected" : "DC03 Pro not detected"
-        statusLabel.textColor = available ? .systemGreen : .systemRed
+        statusLabel.stringValue = available ? "Connected" : "Connect your DC03 Pro"
+        statusDot.layer?.backgroundColor = available ? NSColor.systemGreen.cgColor : NSColor.systemGray.cgColor
         onStatusChange?(available)
+    }
+
+    @objc private func sliderChanged() {
+        volumeValueLabel.stringValue = "\(Int(volumeSlider.doubleValue.rounded()))"
+        balanceValueLabel.stringValue = "\(Int(balanceSlider.doubleValue.rounded()))"
     }
 
     @objc private func presetPressed(_ sender: NSButton) {
@@ -446,28 +522,38 @@ private final class ControlViewController: NSViewController {
         send("Volume \(volume), balance \(balance)", volumeReports(volume: volume, balance: balance))
     }
 
-    @objc private func sendRaw() {
-        do {
-            let report = try parseRawReport(rawField.stringValue)
-            send("Raw", [report])
-        } catch {
-            logLabel.stringValue = String(describing: error)
-        }
-    }
-
-    @objc private func quit() {
-        NSApp.terminate(nil)
-    }
-
     private func send(_ label: String, _ reports: [[UInt8]]) {
         do {
             try DC03Device.send(reports)
-            logLabel.stringValue = "\(label) sent: \(hexString(reports.last ?? []))"
+            feedbackLabel.stringValue = "\(label) applied"
             refreshStatus()
         } catch {
-            logLabel.stringValue = String(describing: error)
+            feedbackLabel.stringValue = "Unable to apply setting"
             refreshStatus()
         }
+    }
+}
+
+private extension NSStackView {
+    func enclosingCard() -> NSView {
+        let container = NSView()
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        container.layer?.cornerRadius = 16
+        container.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
+        container.layer?.borderWidth = 1
+
+        translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(self)
+
+        NSLayoutConstraint.activate([
+            leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            topAnchor.constraint(equalTo: container.topAnchor),
+            bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+
+        return container
     }
 }
 
@@ -480,12 +566,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        statusItem.button?.title = "DC03"
+        updateStatusIcon(available: DC03Device.isAvailable())
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
 
         controller.onStatusChange = { [weak self] available in
-            self?.statusItem.button?.title = available ? "DC03 *" : "DC03"
+            self?.updateStatusIcon(available: available)
         }
 
         popover.contentViewController = controller
@@ -494,8 +580,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             let available = DC03Device.isAvailable()
-            self?.statusItem.button?.title = available ? "DC03 *" : "DC03"
+            self?.updateStatusIcon(available: available)
         }
+    }
+
+    private func updateStatusIcon(available: Bool) {
+        let symbolName = available ? "waveform.circle.fill" : "waveform.circle"
+        let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: appName)
+        image?.isTemplate = true
+        statusItem.button?.image = image
+        statusItem.button?.imagePosition = .imageOnly
+        statusItem.button?.title = ""
+        statusItem.button?.toolTip = available ? "DC03 Pro connected" : "DC03 Pro Control"
     }
 
     @objc private func togglePopover() {
