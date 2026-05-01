@@ -1,0 +1,36 @@
+.DS_Store
+
+# Build output
+build/
+*.app
+*.dmg
+*.dSYM/
+*.xcarchive/
+DerivedData/
+
+# Xcode/user metadata
+*.xcuserstate
+*.xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Reverse-engineering scratch artifacts
+*.apk
+jadx-*/
+lanzou_*.html
+
+# Removed web prototype artifacts
+node_modules/
+.next/
+app/
+package.json
+package-lock.json
+next-env.d.ts
+next.config.ts
+tsconfig.json
+types/
+
+# Local tools and editor metadata
+.idea/
+.vscode/
+*.swp
+*.swo
